@@ -84,7 +84,14 @@ impl EslConnection {
         let mut transport_rx = FramedRead::new(read_half, esl_codec.clone());
         let transport_tx = Arc::new(Mutex::new(FramedWrite::new(write_half, esl_codec.clone())));
         if connection_type == EslConnectionType::Inbound {
-            transport_rx.next().await;
+            let event = transport_rx.next().await.ok_or_else(||EslError::InternalError("Didn't get auth request message".into()))??;
+            if let Some(event_type) = event.headers.get("Content-Type") {
+                match event_type.as_str().unwrap() {
+                    "auth/request" => trace!("Got auth request. Continuing."),
+                    "text/rude-rejection" => {return Err(EslError::InternalError("Got rejected from socket. Probably not in the ACL".into()))},
+                    other => {return Err(EslError::InternalError(format!("Invalid initial event type: {other}")))}
+                }
+            }
         }
         let mut connection = Self {
             password: password.to_string(),
