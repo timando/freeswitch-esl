@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicBool, Arc};
-use tokio::io::WriteHalf;
+use tokio::io::{WriteHalf, ReadHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{
     oneshot::{channel, Sender},
@@ -18,6 +18,87 @@ use tokio::sync::{
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::trace;
+
+#[derive(Debug)]
+///Simple ESL connection that doesn't do asynchronous notifications
+pub struct EslConnectionSimple {
+    tx: FramedWrite<WriteHalf<TcpStream>, EslCodec>,
+    rx: FramedRead<ReadHalf<TcpStream>, EslCodec>,
+}
+impl EslConnectionSimple{
+    ///Connects and authenticates to a FreeSWITCH.
+    pub async fn new(
+        stream: TcpStream,
+        password: &str,
+    ) -> Result<Self, EslError> {
+        let esl_codec = EslCodec {};
+        let (read_half, write_half) = tokio::io::split(stream);
+        let rx = FramedRead::new(read_half, esl_codec.clone());
+        let tx = FramedWrite::new(write_half, esl_codec.clone());
+        let mut connection = Self{
+            tx,
+            rx,
+        };
+        connection.auth(password).await?;
+        Ok(connection)
+    }
+    async fn auth(&mut self, password: &str) -> Result<(), EslError>{
+        //Remote sends first with either an auth request or an ACL rejection
+        let event = self.rx.next().await.ok_or_else(||EslError::InternalError("Didn't get auth request message".into()))??;
+        if let Some(event_type) = event.headers.get("Content-Type") {
+            match event_type.as_str().unwrap() {
+                "auth/request" => trace!("Got auth request. Continuing."),
+                "text/rude-rejection" => {return Err(EslError::InternalError("Got rejected from socket. Probably not in the ACL".into()))},
+                other => {return Err(EslError::InternalError(format!("Invalid initial event type: {other}")))}
+            }
+        }
+        self.tx.send(format!("auth {password}").as_bytes()).await?;
+
+        let reply = self.rx.next().await.ok_or_else(||EslError::InternalError("Didn't get auth reply message".into()))??;
+        if let Some(event_type) = reply.headers.get("Content-Type") {
+            match event_type.as_str().unwrap() {
+                "command/reply" => {
+                    let reply_text: &serde_json::Value = reply.headers.get("Reply-Text").ok_or_else(||EslError::InternalError("Didn't get auth reply message".into()))?;
+                    let reply_text: &str = reply_text.as_str().ok_or_else(||EslError::InternalError("Auth reply message isn't a string".into()))?;
+                    match reply_text{
+                        "+OK accepted" => trace!("Auth succeeded. Continuing."),
+                        "-ERR invalid" => return Err(EslError::InternalError("Auth rejected. Password is probably wrong".into())),
+                        other => return Err(EslError::InternalError(format!("Invalid auth response reply text: {other}")))
+                    }
+
+                },
+                other => {return Err(EslError::InternalError(format!("Invalid auth response event type: {other}")))}
+            }
+        } else {
+            return Err(EslError::InternalError("Auth reply doesn't have content type".into()))
+        }
+        Ok(())
+    }
+    ///Sends a request and waits for the reply
+    pub async fn send_recv(&mut self, data: &[u8]) -> Result<Event, EslError>{
+        self.tx.send(data).await?;
+        self.rx.next().await.unwrap()
+    }
+    /// sends api command to freeswitch. Will return the result of the API call
+    pub async fn api_raw(&mut self, command: &str) -> Result<String, EslError> {
+        let response = self.send_recv(format!("api {}", command).as_bytes()).await;
+        let event = response?;
+        let body = event
+            .body
+            .ok_or_else(|| EslError::InternalError("Didnt get body in api response".into()))?;
+        Ok(body)
+    }
+    /// sends api command to freeswitch. Will return the result of the API call unless it starts with -ERR then it will wrap it in an ApiError
+    pub async fn api(&mut self, command: &str) -> Result<String, EslError> {
+        let body = self.api_raw(command).await?;
+        if body.starts_with("-ERR") {
+            return Err(EslError::ApiError(body))
+        }
+        Ok(body)
+    }
+}
+
+
 #[derive(Debug)]
 /// contains Esl connection with freeswitch
 pub struct EslConnection {

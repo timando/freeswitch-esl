@@ -80,6 +80,7 @@ pub(crate) mod event;
 pub(crate) mod io;
 
 pub use connection::EslConnection;
+pub use connection::EslConnectionSimple;
 pub use error::*;
 pub use esl::*;
 pub use event::*;
